@@ -1,0 +1,394 @@
+<!-- $Id: mod_dbacl.html,v 1.2 2011/05/11 17:50:24 tj Exp tj $ -->
+<!-- $Source: /home/tj/proftpd/modules/doc/RCS/mod_dbacl.html,v $ -->
+
+<html>
+<head>
+<title>ProFTPD module mod_dbacl</title>
+</head>
+
+<body bgcolor=white>
+
+<hr>
+<center>
+<h2><b>ProFTPD module <code>mod_dbacl</code></b></h2>
+</center>
+<hr><br>
+
+<p>
+The <code>mod_dbacl</code> module is used to map commands/requests to
+ACLs, and then to look up the ACLs/permissions for the path/file in question,
+on a per-command/request basis, from a SQL table.  Thus the
+<code>mod_dbacl</code> module allows the use of SQL tables for controlling
+permissions of files, directories, <i>etc</i> on the server.
+
+<p>
+Installation instructions are discussed <a href="#Installation">here</a>.
+
+<p>
+The most current version of <code>mod_dbacl</code> can be found at:
+<pre>
+  <a href="http://www.castaglia.org/proftpd/">http://www.castaglia.org/proftpd/</a>
+</pre>
+
+<h2>Author</h2>
+<p>
+Please contact TJ Saunders &lt;tj <i>at</i> castaglia.org&gt; with any
+questions, concerns, or suggestions regarding this module.
+
+<h2>Thanks</h2>
+<p>
+<i>2011-05-11</i>: Thanks to Ben Timby &lt;btimby <i>at</i> gmail.com&gt;
+for providing the path splitting idea and suggested lookup query.
+
+<h2>Directives</h2>
+<ul>
+  <li><a href="#DBACLEngine">DBACLEngine</a>
+  <li><a href="#DBACLPolicy">DBACLPolicy</a>
+  <li><a href="#DBACLSchema">DBACLSchema</a>
+  <li><a href="#DBACLWhereClause">DBACLWhereClause</a>
+</ul>
+
+<p>
+<hr>
+<h2><a name="DBACLEngine">DBACLEngine</a></h2>
+<strong>Syntax:</strong> DBACLEngine <em>on|off</em><br>
+<strong>Default:</strong> off<br>
+<strong>Context:</strong> server config, <code>&lt;VirtualHost&gt;</code>, <code>&lt;Global&gt;</code><br>
+<strong>Module:</strong> mod_dbacl<br>
+<strong>Compatibility:</strong> 1.3.4rc3 and later
+
+<p>
+The <code>DBACLEngine</code> directive enables or disables the
+<code>mod_dbacl</code> module.
+
+<p>
+<hr>
+<h2><a name="DBACLPolicy">DBACLPolicy</a></h2>
+<strong>Syntax:</strong> DBACLPolicy <em>"allow"|"deny"</em><br>
+<strong>Default:</strong> DBACLPolicy allow<br>
+<strong>Context:</strong> server config, <code>&lt;VirtualHost&gt;</code>, <code>&lt;Global&gt;</code><br>
+<strong>Module:</strong> mod_dbacl<br>
+<strong>Compatibility:</strong> 1.3.4rc3 and later
+
+<p>
+The <code>DBACLPolicy</code> directive configures the default policy to use,
+when <code>mod_dbacl</code> is unable to retrieve the ACL setting from the
+SQL table, <i>e.g.</i> due to database misconfiguration or due to lack of
+database entries for the paths/ACLs in question.
+
+<p>
+The default <code>DBACLPolicy</code> setting of "allow" is
+<b>highly recommended</b>.  You should only use "DBACLPolicy deny" if you need
+to have a "fail-closed" system of permissions on your server.
+
+<p>
+<hr>
+<h2><a name="DBACLSchema">DBACLSchema</a></h2>
+<strong>Syntax:</strong> DBACLSchema <em>table [path-col read-col write-col delete-col create-col modify-col move-col view-col navigate-col]</em><br>
+<strong>Default:</strong> DBACLSchema ftpacl path read_acl write_acl delete_acl create_acl modify_acl move_acl view_acl navigate_acl<br>
+<strong>Context:</strong> server config, <code>&lt;VirtualHost&gt;</code>, <code>&lt;Global&gt;</code><br>
+<strong>Module:</strong> mod_dbacl<br>
+<strong>Compatibility:</strong> 1.3.4rc3 and later
+
+<p>
+The <code>DBACLSchema</code> directive can be used to override the
+default SQL table and column names expected by the <code>mod_dbacl</code>
+module.  More details on the SQL schema used by this module can be found in
+the <a href="#Usage">usage</a> section.
+
+<p>
+<hr>
+<h2><a name="DBACLWhereClause">DBACLWhereClause</a></h2>
+<strong>Syntax:</strong> DBACLWhereClause <em>clause</em><br>
+<strong>Default:</strong> None<br>
+<strong>Context:</strong> server config, <code>&lt;VirtualHost&gt;</code>, <code>&lt;Global&gt;</code><br>
+<strong>Module:</strong> mod_dbacl<br>
+<strong>Compatibility:</strong> 1.3.4rc3 and later
+
+<p>
+The <code>DBACLWhereClause</code> directive configures an additional clause
+to add to the SQL <code>WHERE</code> clause constructed by
+<code>mod_dbacl</code>.  The configured <code>WHERE</code> clause can be
+used to look up user/group-specific ACLs, for example.
+
+<p>
+Example <code>WHERE</code> clause of user-specific lookups:
+<pre>
+  DBACLWhereClause "user = '%u'"
+</pre>
+<b>Note</b>: If you use <code>DBACLWhereClause</code>, make sure that
+the columns named in the <code>WHERE</code> clause also have indexes on them,
+so that the SQL query can be executed more quickly.
+
+<p>
+<hr>
+<h2><a name="Installation">Installation</a></h2>
+To install <code>mod_dbacl</code>, copy the <code>mod_dbacl.c</code> file into
+the third-party module area in the proftpd source code:
+<pre>
+  cp mod_dbacl.c <i>proftpd-dir</i>/contrib/
+</pre>
+after unpacking the latest proftpd-1.3.<i>x</i> source code.  For including
+<code>mod_dbacl</code> as a staticly linked module:
+<pre>
+  ./configure --with-modules=mod_dbacl:mod_sql ...
+</pre>
+Alternatively, <code>mod_dbacl</code> can be built as a DSO module:
+<pre>
+  ./configure --enable-dso --with-shared=mod_dbacl ...
+</pre>
+Then follow the usual steps:
+<pre>
+  make
+  make install
+</pre>
+
+<p>
+<hr>
+<h2><a name="Usage">Usage</a></h2>
+
+<p>
+Since the <code>mod_dbacl</code> module looks up ACLs/permissions from
+SQL tables, it requires that the <code>mod_sql</code> module (and a
+<code>mod_sql</code> module such as <code>mod_sql_mysql</code>,
+<code>mod_sql_postgres</code>, <code>mod_sql_sqlite</code>, <i>etc</i>) be
+used.  For example, your <code>configure</code> command to build
+<code>proftpd</code> might look like:
+<pre>
+  # ./configure --with-modules=mod_sql:mod_sql_sqlite:mod_dbacl ...
+</pre>
+
+<p>
+<b>Mapping Commands/Requests to ACLs</b><br>
+The <code>mod_dbacl</code> works by first mapping each command/request to
+a specific ACL (<i>i.e.</i> a "permission group"), and then looking for the
+value for that ACL/path pair in the SQL table.
+
+<p>
+The ACLs currently supported by <code>mod_dbacl</code>, and the
+commands/requests for those ACLs, are:
+<table border=1>
+  <tr>
+    <td>&nbsp;<b>ACL</b>&nbsp;</td>
+    <td>&nbsp;<b>Commands</b>&nbsp;<td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>READ</code>&nbsp;</td>
+    <td>&nbsp;<code>RETR</code>&nbsp;</td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>WRITE</code>&nbsp;</td>
+    <td>&nbsp;<code>APPE</code>, <code>STOR</code>, STOU</code>&nbsp;</td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>DELETE</code>&nbsp;</td>
+    <td>&nbsp;<code>DELE</code>, <code>RMD</code>, <code>XRMD</code>&nbsp;</td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>CREATE</code>&nbsp;</td>
+    <td>&nbsp;<code>MKD</code>, <code>XMKD</code>, <code>LINK</code>, <code>SYMLINK</code>&nbsp;</td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>MODIFY</code>&nbsp;</td>
+    <td>&nbsp;<code>MFF</code>, <code>MFMT</code>, <code>SITE CHGRP</code>, <code>SITE CHMOD</code>, <code>SETSTAT</code>, <code>FSETSTAT</code>&nbsp;</td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>MOVE</code>&nbsp;</td>
+    <td>&nbsp;<code>RNFR</code>, <code>RNTO</code>, <code>SITE CPTO</code>, <code>RENAME</code>&nbsp;</td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>VIEW</code>&nbsp;</td>
+    <td>&nbsp;<code>LIST</code>, <code>MDTM</code>, <code>MLSD</code>, <code>MLST</code>, <code>NLST</code>, <code>SIZE</code>, <code>STAT</code>, <code>LSTAT</code>, <code>OPENDIR</code>, <code>READLINK</code>&nbsp;</td>
+  </tr>
+
+  <tr>
+    <td>&nbsp;<code>NAVIGATE</code>&nbsp;</td>
+    <td>&nbsp;<code>CDUP</code>, <code>XCDUP</code>, <code>CWD</code>, <code>XCWD</code>, <code>PWD</code>, <code>XPWD</code>, <code>REALPATH</code>&nbsp;</td>
+  </tr>
+</table>
+
+<p>
+<b>Use the <code>NAVIGATE</code> ACL with caution.</b> Many clients, both FTP
+and SFTP, will not function properly if they are unable to execute commands
+such as <code>PWD</code> or <code>REALPATH</code>.  If you <i>do</i> use
+the <code>NAVIGATE</code> ACL, make sure that it restricts only very specific
+areas of your filesystem.
+
+<p>
+<b>Splitting Paths into Component List</b><br>
+Once the command/request has been mapped to its ACL, the <code>mod_dbacl</code>
+looks at the path to the file/directory being requested by the client.
+<b>Note</b> that <code>mod_dbacl</code> <i>always works on absolute paths</i>;
+it resolves the path as sent by the client into the absolute path, regardless
+of any <code>chroot(2)</code> which may be in effect for the session.
+
+<p>
+The path-splitting algorithm takes a path like:
+<pre>
+  /home/user/dir/file.txt
+</pre>
+and breaks it down into a list of ever-more specific paths, like this:
+<pre>
+  /home
+  /home/user
+  /home/user/dir
+  /home/user/dir/file.txt
+</pre>
+Armed with this list, the <code>mod_dbacl</code> module can look for the
+closest-matching path in the SQL table, if any, which covers the path
+requested by the client.
+
+<p>
+This approach allows administrators to configure ACLs that cover broad
+ranges of filesystems (<i>e.g.</i> "/var") to very specific files, as they
+need.
+
+<p>
+<b>Database Schema</b><br>
+So what does the database schema used by <code>mod_dbacl</code> look like?
+Here's an example SQLite script, which creates the table used by
+<code>mod_dbacl</code>, using the default table and column names:
+<pre>
+  CREATE TABLE ftpacl (
+    path TEXT NOT NULL,
+    read_acl TEXT,
+    write_acl TEXT,
+    delete_acl TEXT,
+    create_acl TEXT,
+    modify_acl TEXT,
+    move_acl TEXT,
+    view_acl TEXT,
+    navigate_acl TEXT
+  );
+
+  CREATE INDEX ftpacl_path_idx ON ftpacl (path);
+</pre>
+<b>Note</b> that creating an index on the <code>ftpacl.path</code> column
+is <b>strongly recommended</b>.  Without an index on that column, your
+<code>mod_dbacl</code> lookups <i>will</i> be quite slow.
+
+<p>
+The string values which can appear in the ACL columns can be any of the
+following:
+<ul>
+  <li>true/false
+  <li>on/off
+  <li>allow/deny
+  <li>allowed/denied
+  <li>yes/no
+</ul>
+where "true"/"on" <i>etc</i> mean that the client has permission for that
+ACL/path combination, and "false"/"off" <i>etc</i> mean that the client does
+<b>not</b> have permssion, and <code>mod_dbacl</code> will deny that request.
+
+<p>
+<b>Module Configuration</b><br>
+<p>
+Configuring the <code>mod_dbacl</code> module is quite simple, as most of
+the configuration lies in the SQL tables.  To enable <code>mod_dbacl</code>
+and use the default table/column names, simply use:
+<pre>
+  &lt;IfModule mod_dbacl.c&gt;
+    DBACLEngine on
+  &lt;/IfModule&gt;
+</pre>
+That's it!
+
+<p>
+<b>Example Command</b><br>
+To illustrate all of this, let's take a common FTP command and walk through
+how <code>mod_dbacl</code> would work.  First, the FTP client (after
+authenticating) sends a <code>RETR</code> command to download a file:
+<pre>
+  RETR dir/file.txt
+</pre>
+
+<p>
+The <code>RETR</code> command is mapped to its ACL, <i>i.e.</i> the "READ" ACL.
+Then the path is resolved to the absolute path, then split into a list,
+<i>i.e.</i>:
+<pre>
+  /home
+  /home/user
+  /home/user/dir
+  /home/user/dir/file.txt
+</pre>
+
+<p>
+With the ACL and the path list, <code>mod_dbacl</code> builds up the SQL
+query to use:
+<pre>
+  SELECT read_acl FROM ftpacl
+    WHERE path IN ('/home',
+                   '/home/user',
+                   '/home/user/dir',
+                   '/home/user/dir/file.txt')
+    ORDER BY LENGTH(path) DESC LIMIT 1
+</pre>
+
+<p>
+In the <code>ftpacl</code> database table, assume the following rows are
+present:
+<pre>
+  |--------------------------------------------------|
+  |  PATH                    |  READ_ACL             |
+  |--------------------------------------------------|
+  | /home                    |  false                |
+  | /home/user/dir           |  false                |
+  | /home/user/dir/file.txt  |  true                 |
+  |--------------------------------------------------|
+</pre>
+The longest matching path in the table is "/home/user/dir/file.txt", which
+matches the path being download by the FTP client.  The value for the
+<code>ftpacl.read_acl</code> column is "true", thus <code>mod_dbacl</code>
+allows the command to proceed.
+
+<p>
+<b>Note</b> that <code>mod_dbacl</code> does <b>not</b> override any
+<code>&lt;Directory&gt;</code>/<code>&lt;Limit&gt;</code> sections which may
+also be configured, nor does it override the underlying filesystem permissions.
+
+<p>
+<b>Logging/Debugging</b><br>
+Rather than having its own separate log file, the <code>mod_dbacl</code>
+module uses the "dbacl" <a href="http://www.proftpd.org/docs/howto/Tracing.html">trace</a> log channel in the <code>TraceLog</code>.  Thus to enable logging
+for <code>mod_dbacl</code>, in order to debug configuration issues, you would
+use the following in your <code>proftpd.conf</code>:
+<pre>
+  TraceLog /path/to/ftpd/trace.log
+  Trace dbacl:20 ...
+</pre>
+
+<p>
+<b>SFTP/SCP Interoperability</b><br>
+The <code>mod_dbacl</code> does work with the <code>mod_sftp</code> module
+such that SFTP requests are also handled/processed, just as FTP commands are
+handled.  <b>Note</b> that SCP transfers may not work as expected with
+<code>mod_dbacl</code> yet (notably directory creation for recursive SCP
+uploads).
+
+<p>
+<hr><br>
+
+Author: <i>$Author: tj $</i><br>
+Last Updated: <i>$Date: 2011/05/11 17:50:24 $</i><br>
+
+<br><hr>
+
+<font size=2><b><i>
+&copy; Copyright 2011 TJ Saunders<br>
+ All Rights Reserved<br>
+</i></b></font>
+
+<hr><br>
+
+</body>
+</html>
+

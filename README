@@ -1,0 +1,4 @@
+The mod_dbacl module for ProFTPD uses the mod_sql module for SQL table
+access; the module uses SQL tables for reading ACLs for files/directories.
+
+For further module documentation, see mod_dbacl.html.
