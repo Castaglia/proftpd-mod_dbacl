@@ -254,7 +254,8 @@ static char *dbacl_get_path_skip_opts(cmd_rec *cmd) {
 static char *dbacl_get_path(cmd_rec *cmd, const char *proto) {
   char *path = NULL, *abs_path = NULL;
 
-  if (strncasecmp(proto, "ftp", 4) == 0) {
+  if (strncasecmp(proto, "ftp", 4) == 0 ||
+      strncasecmp(proto, "ftps", 5) == 0) {
     if (pr_cmd_cmp(cmd, PR_CMD_SITE_ID) == 0) {
         if (strncasecmp(cmd->argv[1], "CHMOD", 6) == 0 ||
             strncasecmp(cmd->argv[1], "CHGRP", 6) == 0) {
