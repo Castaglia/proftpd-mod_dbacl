@@ -1,6 +1,3 @@
-<!-- $Id: mod_dbacl.html,v 1.2 2011/05/11 17:50:24 tj Exp tj $ -->
-<!-- $Source: /home/tj/proftpd/modules/doc/RCS/mod_dbacl.html,v $ -->
-
 <html>
 <head>
 <title>ProFTPD module mod_dbacl</title>
@@ -126,21 +123,21 @@ so that the SQL query can be executed more quickly.
 To install <code>mod_dbacl</code>, copy the <code>mod_dbacl.c</code> file into
 the third-party module area in the proftpd source code:
 <pre>
-  cp mod_dbacl.c <i>proftpd-dir</i>/contrib/
+  $ cp mod_dbacl.c <i>proftpd-dir</i>/contrib/
 </pre>
 after unpacking the latest proftpd-1.3.<i>x</i> source code.  For including
 <code>mod_dbacl</code> as a staticly linked module:
 <pre>
-  ./configure --with-modules=mod_dbacl:mod_sql ...
+  $ ./configure --with-modules=mod_sql:mod_dbacl ...
 </pre>
 Alternatively, <code>mod_dbacl</code> can be built as a DSO module:
 <pre>
-  ./configure --enable-dso --with-shared=mod_dbacl ...
+  $ ./configure --enable-dso --with-shared=mod_dbacl ...
 </pre>
 Then follow the usual steps:
 <pre>
-  make
-  make install
+  $ make
+  $ make install
 </pre>
 
 <p>
@@ -155,7 +152,7 @@ SQL tables, it requires that the <code>mod_sql</code> module (and a
 used.  For example, your <code>configure</code> command to build
 <code>proftpd</code> might look like:
 <pre>
-  # ./configure --with-modules=mod_sql:mod_sql_sqlite:mod_dbacl ...
+  $ ./configure --with-modules=mod_sql:mod_sql_sqlite:mod_dbacl ...
 </pre>
 
 <p>
@@ -377,13 +374,8 @@ uploads).
 <p>
 <hr><br>
 
-Author: <i>$Author: tj $</i><br>
-Last Updated: <i>$Date: 2011/05/11 17:50:24 $</i><br>
-
-<br><hr>
-
 <font size=2><b><i>
-&copy; Copyright 2011 TJ Saunders<br>
+&copy; Copyright 2011-2016 TJ Saunders<br>
  All Rights Reserved<br>
 </i></b></font>
 
