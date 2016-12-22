@@ -1,7 +1,15 @@
 proftpd-mod_dbacl
 =================
-The `mod_dbacl` module for ProFTPD uses the `mod_sql` module for SQL table
-access; the module uses SQL tables for reading ACLs for files/directories.
+
+Status
+------
+[![Build Status](https://travis-ci.org/Castaglia/proftpd-mod_dbacl.svg?branch=master)](https://travis-ci.org/Castaglia/proftpd-mod_dbacl)
+[![License](https://img.shields.io/badge/license-GPL-brightgreen.svg)](https://img.shields.io/badge/license-GPL-brightgreen.svg)
+
+Synopsis
+--------
+The `mod_dbacl` module for ProFTPD uses the [`mod_sql`](http://www.proftpd.org/docs/contrib/mod_sql.html) module for SQL table access; the module uses SQL
+tables for reading ACLs for files/directories.
 
 For further module documentation, see [mod_dbacl.html](https://htmlpreview.github.io/?https://github.com/Castaglia/proftpd-mod_dbacl/blob/master/mod_dbacl.html).
 
