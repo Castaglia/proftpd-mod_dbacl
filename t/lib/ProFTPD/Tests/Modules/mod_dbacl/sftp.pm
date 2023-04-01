@@ -815,7 +815,7 @@ EOS
         my ($err_code, $err_name) = $sftp->error();
         die("Can't write test.txt: [$err_name] ($err_code)");
       }
-    
+
       # To issue the FXP_CLOSE, we have to explicitly destroy the filehandle
       $fh = undef;
 

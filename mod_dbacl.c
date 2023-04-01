@@ -736,7 +736,7 @@ static void dbacl_set_error_response(cmd_rec *cmd, const char *msg) {
     if (arglen == 0) {
       /* No options, no path. */
       pr_response_add_err(R_450, ".: %s", msg);
-       
+
     } else {
       char *path;
 
@@ -998,7 +998,7 @@ MODRET dbacl_post_pass(cmd_rec *cmd) {
 
     pr_trace_msg(trace_channel, 15,
       "using column name '%s' for paths", dbacl_path_col);
-     
+
     pr_trace_msg(trace_channel, 15,
       "using column name '%s' for the READ ACL", dbacl_read_col);
 
