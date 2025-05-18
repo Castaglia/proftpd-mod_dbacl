@@ -1,7 +1,6 @@
 /*
  * ProFTPD: mod_dbacl -- a module for checking access control lists in a DB
- *
- * Copyright (c) 2011 TJ Saunders
+ * Copyright (c) 2011-2025 TJ Saunders
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -857,7 +856,7 @@ MODRET set_dbaclpolicy(cmd_rec *cmd) {
     policy = DBACL_POLICY_DENY;
 
   } else {
-    CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "uknown DBACLPolicy '",
+    CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "unknown DBACLPolicy '",
       cmd->argv[1], "'", NULL));
   }
 
