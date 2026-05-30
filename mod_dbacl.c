@@ -1,6 +1,6 @@
 /*
  * ProFTPD: mod_dbacl -- a module for checking access control lists in a DB
- * Copyright (c) 2011-2025 TJ Saunders
+ * Copyright (c) 2011-2026 TJ Saunders
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -13,8 +13,7 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307, USA.
+ * along with this program; see <https://www.gnu.org/licenses/>.
  *
  * As a special exemption, TJ Saunders and other respective copyright holders
  * give permission to link this program with OpenSSL, and distribute the
@@ -23,18 +22,17 @@
  *
  * This is mod_dbacl, contrib software for proftpd 1.3.x and above.
  * For more information contact TJ Saunders <tj@castaglia.org>.
- *
- * $Id: mod_dbacl.c,v 1.1 2011/05/11 17:51:09 tj Exp tj $
  */
 
 #include "conf.h"
 #include "privs.h"
+#include "jot.h"
 
-#define MOD_DBACL_VERSION		"mod_dbacl/0.0"
+#define MOD_DBACL_VERSION		"mod_dbacl/0.1"
 
 /* Make sure the version of proftpd is as necessary. */
-#if PROFTPD_VERSION_NUMBER < 0x0001030403
-# error "ProFTPD 1.3.4rc3 or later required"
+#if PROFTPD_VERSION_NUMBER < 0x0001030801
+# error "ProFTPD 1.3.8rc1 or later required"
 #endif
 
 module dbacl_module;
@@ -87,14 +85,15 @@ static cmd_rec *dbacl_cmd_create(pool *parent_pool, int argc, ...) {
   cmd->pool = cmd_pool;
 
   cmd->argc = argc;
-  cmd->argv = (char **) pcalloc(cmd->pool, argc * sizeof(char *));
+  cmd->argv = pcalloc(cmd->pool, argc * sizeof(void *));
 
   /* Hmmm... */
   cmd->tmp_pool = cmd->pool;
 
   va_start(argp, argc);
-  for (i = 0; i < argc; i++)
+  for (i = 0; i < argc; i++) {
     cmd->argv[i] = va_arg(argp, char *);
+  }
   va_end(argp);
 
   return cmd;
@@ -350,20 +349,21 @@ static const char *dbacl_get_column(cmd_rec *cmd, const char *proto) {
     col = dbacl_navigate_col;
 
   } else if (pr_cmd_cmp(cmd, PR_CMD_SITE_ID) == 0) {
-    if (strncasecmp(cmd->argv[1], "CHMOD", 6) == 0 ||
-        strncasecmp(cmd->argv[1], "CHGRP", 6) == 0) {
+    if (strcasecmp(cmd->argv[1], "CHMOD") == 0 ||
+        strcasecmp(cmd->argv[1], "CHGRP") == 0) {
       col = dbacl_modify_col;
 
-    } else if (strncasecmp(cmd->argv[1], "CPTO", 5) == 0) {
+    } else if (strcasecmp(cmd->argv[1], "CPTO") == 0) {
       col = dbacl_move_col;
     }
 
-  } else if (strncasecmp(proto, "sftp", 5) == 0) {
+  } else if (strcasecmp(proto, "sftp") == 0) {
     /* Mapping of SFTP requests to ACLs */
 
     if (pr_cmd_strcmp(cmd, "LSTAT") == 0 ||
         pr_cmd_strcmp(cmd, "OPENDIR") == 0 ||
-        pr_cmd_strcmp(cmd, "READLINK") == 0) {
+        pr_cmd_strcmp(cmd, "READLINK") == 0 ||
+        pr_cmd_strcmp(cmd, "STAT") == 0) {
       col = dbacl_view_col;
 
     } else if (pr_cmd_strcmp(cmd, "REALPATH") == 0) {
@@ -391,20 +391,26 @@ static int dbacl_is_boolean(const char *str) {
   res = pr_str_is_boolean(str);
   if (res < 0) {
     if (errno == EINVAL) {
-      /* Treat 'allow(ed)' and 'den(y|ied)' as acceptable Boolean values
-       * as well.
-       */
-      if (strncasecmp(str, "allow", 6) == 0 ||
-          strncasecmp(str, "allowed", 8) == 0) {
-        res = TRUE;
+      if (str != NULL) {
+        /* Treat 'allow(ed)' and 'den(y|ied)' as acceptable Boolean values
+         * as well.
+         */
+        if (strcasecmp(str, "allow") == 0 ||
+            strcasecmp(str, "allowed") == 0) {
+          res = TRUE;
 
-      } else if (strncasecmp(str, "deny", 5) == 0 ||
-                 strncasecmp(str, "denied", 7) == 0) {
-        res = FALSE;
+        } else if (strcasecmp(str, "deny") == 0 ||
+                   strcasecmp(str, "denied") == 0) {
+          res = FALSE;
+
+        } else {
+          pr_trace_msg(trace_channel, 6,
+            "unable to interpret database value '%s' as Boolean value", str);
+        }
 
       } else {
         pr_trace_msg(trace_channel, 6,
-          "unable to interpret database value '%s' as Boolean value", str);
+          "unable to interpret null database value as Boolean value");
       }
     }
   }
@@ -412,11 +418,44 @@ static int dbacl_is_boolean(const char *str) {
   return res;
 }
 
+static int dbacl_parse_query(pool *p, const char *stmt_text,
+    unsigned char *stmt_buf, size_t stmt_bufsz, size_t *stmt_buflen,
+    int flags) {
+  int res;
+  pool *tmp_pool;
+  pr_jot_ctx_t *jot_ctx;
+  pr_jot_parsed_t *jot_parsed;
+
+  tmp_pool = make_sub_pool(p);
+  jot_ctx = pcalloc(tmp_pool, sizeof(pr_jot_ctx_t));
+  jot_parsed = pcalloc(tmp_pool, sizeof(pr_jot_parsed_t));
+  jot_parsed->bufsz = jot_parsed->buflen = stmt_bufsz;
+  jot_parsed->ptr = jot_parsed->buf = stmt_buf;
+
+  jot_ctx->log = jot_parsed;
+
+  res = pr_jot_parse_logfmt(tmp_pool, stmt_text, jot_ctx, pr_jot_parse_on_meta,
+    pr_jot_parse_on_unknown, pr_jot_parse_on_other, flags);
+  if (res < 0) {
+    pr_log_pri(PR_LOG_NOTICE, MOD_DBACL_VERSION
+      ": error parsing query '%s': %s", stmt_text, strerror(errno));
+  }
+
+  *stmt_buflen = jot_parsed->bufsz - jot_parsed->buflen;
+  stmt_buf[*stmt_buflen] = '\0';
+
+  destroy_pool(tmp_pool);
+  return res;
+}
+
 static int dbacl_get_row(pool *p, const char *acl_col,
     array_header *path_elts) {
   register unsigned int i;
+  int res;
   cmd_rec *sql_cmd = NULL;
-  char *query = NULL, *query_name = NULL, **elts, **values;
+  char *query = NULL, *query_name = NULL, *parsed, **elts, **values;
+  unsigned char stmt_buf[4096];
+  size_t stmt_buflen;
   array_header *list_elts, *sql_data = NULL;
   cmdtable *sql_cmdtab = NULL;
   modret_t *sql_res = NULL;
@@ -494,10 +533,26 @@ static int dbacl_get_row(pool *p, const char *acl_col,
 
   pr_trace_msg(trace_channel, 7, "constructed query '%s'", query);
 
+  /* Since we are programmatically adding a SQLNamedQuery config_rec here,
+   * we need to parse the constructed query, just as mod_sql's SQLNamedQuery
+   * directive handler does.
+   */
+  res = dbacl_parse_query(p, query, stmt_buf, sizeof(stmt_buf)-1,
+    &stmt_buflen, PR_JOT_LOGFMT_PARSE_FL_UNKNOWN_AS_CUSTOM);
+  if (res < 0) {
+    pr_trace_msg(trace_channel, 2,
+      "error processing SQL query '%s': %s", query, strerror(errno));
+    errno = EPERM;
+    return -1;
+  }
+
   /* Cheat, and programmatically create a SQLNamedQuery for this query. */
   query_name = pstrcat(p, "SQLNamedQuery_", MOD_DBACL_VERSION, NULL);
 
-  add_config_param_set(&(main_server->conf), query_name, 3, "SELECT", query,
+  parsed = pcalloc(p, stmt_buflen+1);
+  memcpy(parsed, stmt_buf, stmt_buflen);
+
+  add_config_param_set(&(main_server->conf), query_name, 3, "SELECT", parsed,
     dbacl_conn_name);
 
   sql_cmd = dbacl_cmd_create(p, 2, "sql_lookup", MOD_DBACL_VERSION);
@@ -624,7 +679,7 @@ static int dbacl_get_acl(cmd_rec *cmd, const char *proto, int *policy) {
   acl_col = dbacl_get_column(cmd, proto);
   if (acl_col == NULL) {
     pr_trace_msg(trace_channel, 4,
-      "no mapping of command '%s' to ACL column", cmd->argv[0]);
+      "no mapping of command '%s' to ACL column", (char *) cmd->argv[0]);
     return -1;
   }
 
@@ -639,7 +694,7 @@ static int dbacl_get_acl(cmd_rec *cmd, const char *proto, int *policy) {
     path = dbacl_get_path(cmd, proto);
     if (path == NULL) {
       pr_trace_msg(trace_channel, 4,
-        "unable to get full path for command '%s'", cmd->argv[0]);
+        "unable to get full path for command '%s'", (char *) cmd->argv[0]);
       return -1;
     }
 
@@ -657,7 +712,7 @@ static int dbacl_get_acl(cmd_rec *cmd, const char *proto, int *policy) {
       path = dbacl_get_path(cmd, proto);
       if (path == NULL) {
         pr_trace_msg(trace_channel, 4,
-          "unable to get full path for command '%s'", cmd->argv[0]);
+          "unable to get full path for command '%s'", (char *) cmd->argv[0]);
         return -1;
       }
 
@@ -676,7 +731,7 @@ static int dbacl_get_acl(cmd_rec *cmd, const char *proto, int *policy) {
       if (ptr == NULL) {
         /* Malformed SFTP SYMLINK/LINK cmd_rec. */
         pr_trace_msg(trace_channel, 1,
-          "malformed SFTP %s request, ignoring", cmd->argv[0]);
+          "malformed SFTP %s request, ignoring", (char *) cmd->argv[0]);
         errno = EINVAL;
         return -1;
       }
@@ -753,7 +808,7 @@ static void dbacl_set_error_response(cmd_rec *cmd, const char *msg) {
 
   } else if (pr_cmd_cmp(cmd, PR_CMD_MFMT_ID) == 0 ||
              pr_cmd_cmp(cmd, PR_CMD_MFF_ID) == 0) {
-    pr_response_add_err(R_550, "%s: %s", cmd->argv[2], msg);
+    pr_response_add_err(R_550, "%s: %s", (char *) cmd->argv[2], msg);
 
   } else if (pr_cmd_cmp(cmd, PR_CMD_MLSD_ID) == 0 ||
              pr_cmd_cmp(cmd, PR_CMD_MLST_ID) == 0) {
@@ -916,7 +971,7 @@ MODRET dbacl_pre_cmd(cmd_rec *cmd) {
   int policy, res;
   const char *proto;
 
-  if (!dbacl_engine) {
+  if (dbacl_engine == FALSE) {
     return PR_DECLINED(cmd);
   }
 
@@ -928,7 +983,7 @@ MODRET dbacl_pre_cmd(cmd_rec *cmd) {
       pr_trace_msg(trace_channel, 3,
         "error looking up ACL for %s command/resource (protocol '%s') "
         "and 'DBACLPolicy deny' setting in effect, rejecting command",
-        cmd->argv[0], proto);
+        (char *) cmd->argv[0], proto);
 
       dbacl_set_error_response(cmd, strerror(EACCES));
       errno = EACCES;
@@ -941,7 +996,7 @@ MODRET dbacl_pre_cmd(cmd_rec *cmd) {
   if (policy == DBACL_POLICY_DENY) {
     pr_trace_msg(trace_channel, 3,
       "configured ACL for %s command/resource (protocol '%s') denies "
-      "access, rejecting command", cmd->argv[0], proto);
+      "access, rejecting command", (char *) cmd->argv[0], proto);
 
     dbacl_set_error_response(cmd, strerror(EACCES));
     errno = EACCES;
@@ -950,7 +1005,7 @@ MODRET dbacl_pre_cmd(cmd_rec *cmd) {
 
   pr_trace_msg(trace_channel, 9,
     "configured ACL for %s command/resource (protocol '%s') allows access, "
-    "permitting command", cmd->argv[0], proto);
+    "permitting command", (char *) cmd->argv[0], proto);
 
   return PR_DECLINED(cmd);
 }
@@ -959,16 +1014,16 @@ MODRET dbacl_post_pass(cmd_rec *cmd) {
   config_rec *c;
 
   c = find_config(main_server->conf, CONF_PARAM, "DBACLEngine", FALSE);
-  if (c) {
+  if (c != NULL) {
     dbacl_engine = *((int *) c->argv[0]);
   }
 
-  if (!dbacl_engine) {
+  if (dbacl_engine == FALSE) {
     return PR_DECLINED(cmd);
   }
 
   c = find_config(main_server->conf, CONF_PARAM, "DBACLSchema", FALSE);
-  if (c) {
+  if (c != NULL) {
     if (c->argc == 1) {
       dbacl_table = c->argv[0];
 
@@ -1024,12 +1079,12 @@ MODRET dbacl_post_pass(cmd_rec *cmd) {
   }
 
   c = find_config(main_server->conf, CONF_PARAM, "DBACLPolicy", FALSE);
-  if (c) {
+  if (c != NULL) {
     dbacl_policy = *((int *) c->argv[0]);
   }
 
   c = find_config(main_server->conf, CONF_PARAM, "DBACLWhereClause", FALSE);
-  if (c) {
+  if (c != NULL) {
     dbacl_where_clause = c->argv[0];
   }
 
