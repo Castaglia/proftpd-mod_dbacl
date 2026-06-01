@@ -176,22 +176,7 @@ sub set_up {
 sub dbacl_sftp_download_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -199,6 +184,13 @@ sub dbacl_sftp_download_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -215,7 +207,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, read_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -238,30 +229,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -274,15 +242,31 @@ EOS
 
   my $test_sz = -s $test_file;
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -295,7 +279,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -304,12 +288,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -331,16 +316,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -378,7 +363,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -387,7 +371,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -397,36 +381,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_download_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -434,6 +398,13 @@ sub dbacl_sftp_download_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -450,7 +421,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, read_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -473,30 +443,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -509,15 +456,31 @@ EOS
 
   my $test_sz = -s $test_file;
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -530,7 +493,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -539,12 +502,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -566,16 +530,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -593,9 +557,7 @@ EOS
 
       my ($err_code, $err_name) = $sftp->error();
 
-      my $expected;
-
-      $expected = 'SSH_FX_PERMISSION_DENIED';
+      my $expected = 'SSH_FX_PERMISSION_DENIED';
       $self->assert($expected eq $err_name,
         test_msg("Expected '$expected', got '$err_name'"));
 
@@ -604,7 +566,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -613,7 +574,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -623,36 +584,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_upload_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -660,6 +601,13 @@ sub dbacl_sftp_upload_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -676,7 +624,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, write_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -705,35 +652,24 @@ EOS
     unless (chmod(0666, $db_file)) {
       die("Can't set perms on $db_file to 0666: $!");
     }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
   }
 
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
+  my $test_sz = 14;
 
   my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
   my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
-  my $test_sz = 14;
-
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -746,7 +682,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -755,12 +691,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -782,16 +719,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -828,7 +765,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -837,7 +773,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -847,36 +783,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_upload_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -884,6 +800,13 @@ sub dbacl_sftp_upload_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -900,7 +823,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, write_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -929,35 +851,24 @@ EOS
     unless (chmod(0666, $db_file)) {
       die("Can't set perms on $db_file to 0666: $!");
     }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
   }
 
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
+  my $test_sz = 14;
 
   my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
   my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
-  my $test_sz = 14;
-
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -970,7 +881,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -979,12 +890,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -1006,16 +918,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -1042,7 +954,6 @@ EOS
       $self->assert($expected eq $err_name,
         test_msg("Expected '$expected', got '$err_name'"));
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -1051,7 +962,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -1061,36 +972,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_readdir_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -1098,6 +989,13 @@ sub dbacl_sftp_readdir_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -1114,7 +1012,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -1143,35 +1040,21 @@ EOS
     unless (chmod(0666, $db_file)) {
       die("Can't set perms on $db_file to 0666: $!");
     }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
   }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
 
   my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
   my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
-  my $test_sz = 14;
-
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -1184,7 +1067,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -1193,12 +1076,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -1220,16 +1104,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -1303,7 +1187,6 @@ EOS
       $self->assert(0 == $remaining,
         test_msg("Expected 0, got $remaining"));
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -1312,7 +1195,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -1322,36 +1205,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_readdir_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -1359,6 +1222,13 @@ sub dbacl_sftp_readdir_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -1375,7 +1245,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -1404,35 +1273,21 @@ EOS
     unless (chmod(0666, $db_file)) {
       die("Can't set perms on $db_file to 0666: $!");
     }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
   }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
 
   my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
   my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
-  my $test_sz = 14;
-
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -1445,7 +1300,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -1454,12 +1309,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -1481,16 +1337,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -1517,7 +1373,6 @@ EOS
       $self->assert($expected eq $err_name,
         test_msg("Expected '$expected', got '$err_name'"));
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -1526,7 +1381,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -1536,36 +1391,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_remove_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -1573,6 +1408,13 @@ sub dbacl_sftp_remove_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -1589,7 +1431,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, delete_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -1612,30 +1453,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -1646,17 +1464,31 @@ EOS
     die("Can't open $test_file: $!");
   }
 
-  my $test_sz = -s $test_file;
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -1669,7 +1501,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -1678,12 +1510,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -1705,16 +1538,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -1736,7 +1569,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -1745,7 +1577,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -1755,36 +1587,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_remove_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -1792,6 +1604,13 @@ sub dbacl_sftp_remove_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -1808,7 +1627,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, delete_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -1831,30 +1649,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -1865,17 +1660,31 @@ EOS
     die("Can't open $test_file: $!");
   }
 
-  my $test_sz = -s $test_file;
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -1888,7 +1697,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -1897,12 +1706,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -1924,16 +1734,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -1960,7 +1770,6 @@ EOS
       $self->assert($expected eq $err_name,
         test_msg("Expected '$expected', got '$err_name'"));
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -1969,7 +1778,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -1979,36 +1788,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_stat_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -2016,6 +1805,13 @@ sub dbacl_sftp_stat_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -2032,7 +1828,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -2055,30 +1850,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -2091,15 +1863,31 @@ EOS
 
   my $test_sz = -s $test_file;
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -2112,7 +1900,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -2121,12 +1909,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -2148,16 +1937,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -2174,29 +1963,32 @@ EOS
         die("Cannot stat test.txt: [$err_name] ($err_code)");
       }
 
-      my $expected;
-
-      $expected = $test_sz;
+      my $expected = $test_sz;
       my $file_size = $attrs->{size};
       $self->assert($expected == $file_size,
-        test_msg("Expected '$expected', got '$file_size'"));
+        test_msg("Expected file size '$expected', got '$file_size'"));
 
       $expected = $<;
+      if ($< == 0) {
+        $expected = $setup->{uid};
+      }
       my $file_uid = $attrs->{uid};
       $self->assert($expected == $file_uid,
-        test_msg("Expected '$expected', got '$file_uid'"));
+        test_msg("Expected file UID '$expected', got '$file_uid'"));
 
       $expected = $(;
+      if ($< == 0) {
+        $expected = $setup->{gid};
+      }
       my $file_gid = $attrs->{gid};
       $self->assert($expected == $file_gid,
-        test_msg("Expected '$expected', got '$file_gid'"));
+        test_msg("Expected file GID '$expected', got '$file_gid'"));
 
       # To close the SFTP channel, we have to explicitly destroy the object
       $sftp = undef;
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -2205,7 +1997,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -2215,36 +2007,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_stat_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -2252,6 +2024,13 @@ sub dbacl_sftp_stat_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -2268,7 +2047,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -2291,30 +2069,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -2325,17 +2080,31 @@ EOS
     die("Can't open $test_file: $!");
   }
 
-  my $test_sz = -s $test_file;
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -2348,7 +2117,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -2357,12 +2126,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -2384,16 +2154,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -2420,7 +2190,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -2429,7 +2198,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -2439,36 +2208,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_lstat_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -2476,6 +2225,13 @@ sub dbacl_sftp_lstat_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -2492,7 +2248,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -2515,30 +2270,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -2558,15 +2290,31 @@ EOS
 
   my $test_symlink_sz = (lstat($test_symlink))[7];
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -2579,7 +2327,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -2588,12 +2336,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -2615,16 +2364,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -2641,29 +2390,29 @@ EOS
         die("Cannot lstat test.lnk: [$err_name] ($err_code)");
       }
 
-      my $expected;
-
-      $expected = $test_symlink_sz;
-      my $file_size = $attrs->{size};
-      $self->assert($expected == $file_size,
-        test_msg("Expected '$expected', got '$file_size'"));
-
-      $expected = $<;
+      # Symlinks have different sizes across platforms, so skip asserting
+      # on that.
+      my $expected = $<;
+      if ($< == 0) {
+        $expected = $setup->{uid};
+      }
       my $file_uid = $attrs->{uid};
       $self->assert($expected == $file_uid,
-        test_msg("Expected '$expected', got '$file_uid'"));
+        test_msg("Expected file UID '$expected', got '$file_uid'"));
 
       $expected = $(;
+      if ($< == 0) {
+        $expected = $setup->{gid};
+      }
       my $file_gid = $attrs->{gid};
       $self->assert($expected == $file_gid,
-        test_msg("Expected '$expected', got '$file_gid'"));
+        test_msg("Expected file GID '$expected', got '$file_gid'"));
 
       # To close the SFTP channel, we have to explicitly destroy the object
       $sftp = undef;
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -2672,7 +2421,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -2682,36 +2431,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_lstat_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -2719,6 +2448,13 @@ sub dbacl_sftp_lstat_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -2735,7 +2471,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -2758,30 +2493,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -2792,24 +2504,36 @@ EOS
     die("Can't open $test_file: $!");
   }
 
-  my $test_sz = -s $test_file;
-
   my $test_symlink = File::Spec->rel2abs("$tmpdir/test.lnk");
   unless (symlink($test_file, $test_symlink)) {
     die("Can't symlink $test_symlink to $test_file: $!");
   }
 
-  my $test_symlink_sz = (lstat($test_symlink))[7];
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -2822,7 +2546,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -2831,12 +2555,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -2858,16 +2583,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -2886,7 +2611,6 @@ EOS
       my ($err_code, $err_name) = $sftp->error();
 
       my $expected = 'SSH_FX_PERMISSION_DENIED';
-
       $self->assert($expected eq $err_name,
         test_msg("Expected '$expected', got '$err_name'"));
 
@@ -2895,7 +2619,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -2904,7 +2627,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -2914,36 +2637,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_setstat_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -2951,6 +2654,13 @@ sub dbacl_sftp_setstat_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -2967,7 +2677,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, modify_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -2990,30 +2699,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -3024,15 +2710,31 @@ EOS
     die("Can't open $test_file: $!");
   }
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -3045,7 +2747,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -3054,12 +2756,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -3081,16 +2784,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -3115,7 +2818,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -3124,7 +2826,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -3134,36 +2836,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_setstat_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -3171,6 +2853,13 @@ sub dbacl_sftp_setstat_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -3187,7 +2876,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, modify_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -3210,30 +2898,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -3244,15 +2909,31 @@ EOS
     die("Can't open $test_file: $!");
   }
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -3265,7 +2946,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -3274,12 +2955,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -3301,16 +2983,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -3340,7 +3022,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -3349,7 +3030,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -3359,36 +3040,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_fsetstat_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -3396,6 +3057,13 @@ sub dbacl_sftp_fsetstat_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -3412,7 +3080,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, modify_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -3435,30 +3102,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -3469,15 +3113,31 @@ EOS
     die("Can't open $test_file: $!");
   }
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -3490,7 +3150,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -3499,12 +3159,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -3526,16 +3187,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -3566,7 +3227,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -3575,7 +3235,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -3585,36 +3245,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_fsetstat_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -3622,6 +3262,13 @@ sub dbacl_sftp_fsetstat_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -3638,7 +3285,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, modify_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -3661,30 +3307,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -3695,15 +3318,31 @@ EOS
     die("Can't open $test_file: $!");
   }
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -3716,7 +3355,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -3725,12 +3364,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -3752,16 +3392,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -3796,7 +3436,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -3805,7 +3444,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -3815,36 +3454,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_readlink_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -3852,6 +3471,13 @@ sub dbacl_sftp_readlink_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -3868,7 +3494,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -3891,30 +3516,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -3930,15 +3532,31 @@ EOS
     die("Can't symlink $test_symlink to $test_file: $!");
   }
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -3951,7 +3569,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -3960,12 +3578,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -3987,16 +3606,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -4021,7 +3640,6 @@ EOS
       $self->assert($test_file eq $path,
         test_msg("Expected '$test_file', got '$path'"));
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -4030,7 +3648,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -4040,36 +3658,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_readlink_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -4077,6 +3675,13 @@ sub dbacl_sftp_readlink_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -4093,7 +3698,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, view_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -4116,30 +3720,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  my $test_file = File::Spec->rel2abs("$setup->{home_dir}/test.txt");
   if (open(my $fh, "> $test_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -4155,15 +3736,31 @@ EOS
     die("Can't symlink $test_symlink to $test_file: $!");
   }
 
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $test_file)) {
+      die("Can't set owner of $test_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
+
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -4176,7 +3773,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -4185,12 +3782,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -4212,16 +3810,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -4248,7 +3846,6 @@ EOS
       $self->assert($expected eq $err_name,
         test_msg("Expected '$expected', got '$err_name'"));
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -4257,7 +3854,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -4267,36 +3864,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_realpath_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -4304,6 +3881,13 @@ sub dbacl_sftp_realpath_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -4320,7 +3904,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, navigate_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -4349,43 +3932,21 @@ EOS
     unless (chmod(0666, $db_file)) {
       die("Can't set perms on $db_file to 0666: $!");
     }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
   }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
 
   my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
   my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
-  if (open(my $fh, "> $test_file")) {
-    print $fh "Hello, World!\n";
-    unless (close($fh)) {
-      die("Can't write $test_file: $!");
-    }
-
-  } else {
-    die("Can't open $test_file: $!");
-  }
-
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -4398,7 +3959,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -4407,12 +3968,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -4434,16 +3996,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -4460,9 +4022,12 @@ EOS
         die("Can't get real path for '.': [$err_name] ($err_code)");
       }
 
-      my $expected;
+      my $expected = $setup->{home_dir};
+      if ($^O eq 'darwin') {
+        # MacOSX-specific hack
+        $expected = '/private' . $expected;
+      }
 
-      $expected = $home_dir;
       $self->assert($expected eq $cwd,
         test_msg("Expected '$expected', got '$cwd'"));
 
@@ -4471,7 +4036,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -4480,7 +4044,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -4490,36 +4054,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_realpath_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -4527,6 +4071,13 @@ sub dbacl_sftp_realpath_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -4543,7 +4094,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, navigate_acl) VALUES ('$home_dir', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -4572,43 +4122,21 @@ EOS
     unless (chmod(0666, $db_file)) {
       die("Can't set perms on $db_file to 0666: $!");
     }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
   }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
 
   my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
   my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
-  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
-  if (open(my $fh, "> $test_file")) {
-    print $fh "Hello, World!\n";
-    unless (close($fh)) {
-      die("Can't write $test_file: $!");
-    }
-
-  } else {
-    die("Can't open $test_file: $!");
-  }
-
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -4621,7 +4149,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -4630,12 +4158,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -4657,16 +4186,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -4693,7 +4222,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -4702,7 +4230,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -4712,36 +4240,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_rename_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -4749,6 +4257,13 @@ sub dbacl_sftp_rename_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -4765,7 +4280,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, move_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -4788,30 +4302,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $src_file = File::Spec->rel2abs("$home_dir/foo.txt");
+  my $src_file = File::Spec->rel2abs("$setup->{home_dir}/foo.txt");
   if (open(my $fh, "> $src_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -4822,17 +4313,33 @@ EOS
     die("Can't open $src_file: $!");
   }
 
-  my $dst_file = File::Spec->rel2abs("$home_dir/bar.txt");
+  my $dst_file = File::Spec->rel2abs("$setup->{home_dir}/bar.txt");
+
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $src_file)) {
+      die("Can't set owner of $src_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -4845,7 +4352,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -4854,12 +4361,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -4881,16 +4389,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -4912,7 +4420,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -4921,7 +4428,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -4931,36 +4438,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_rename_src_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -4968,6 +4455,13 @@ sub dbacl_sftp_rename_src_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -4985,7 +4479,6 @@ CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, move_acl) VALUES ('$home_dir/foo.txt', 'false');
 INSERT INTO ftpacl (path, move_acl) VALUES ('$home_dir/bar.txt', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -5008,30 +4501,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $src_file = File::Spec->rel2abs("$home_dir/foo.txt");
+  my $src_file = File::Spec->rel2abs("$setup->{home_dir}/foo.txt");
   if (open(my $fh, "> $src_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -5042,17 +4512,33 @@ EOS
     die("Can't open $src_file: $!");
   }
 
-  my $dst_file = File::Spec->rel2abs("$home_dir/bar.txt");
+  my $dst_file = File::Spec->rel2abs("$setup->{home_dir}/bar.txt");
+
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $src_file)) {
+      die("Can't set owner of $src_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
-    Trace => 'dbacl:20 ssh2:20 sftp:20',
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
+    Trace => 'dbacl:20 sftp:10',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -5065,7 +4551,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -5074,12 +4560,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -5101,16 +4588,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -5137,7 +4624,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -5146,7 +4632,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -5156,36 +4642,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_rename_dst_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -5193,6 +4659,13 @@ sub dbacl_sftp_rename_dst_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -5210,7 +4683,6 @@ CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, move_acl) VALUES ('$home_dir/foo.txt', 'true');
 INSERT INTO ftpacl (path, move_acl) VALUES ('$home_dir/bar.txt', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -5233,30 +4705,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $src_file = File::Spec->rel2abs("$home_dir/foo.txt");
+  my $src_file = File::Spec->rel2abs("$setup->{home_dir}/foo.txt");
   if (open(my $fh, "> $src_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -5267,17 +4716,33 @@ EOS
     die("Can't open $src_file: $!");
   }
 
-  my $dst_file = File::Spec->rel2abs("$home_dir/bar.txt");
+  my $dst_file = File::Spec->rel2abs("$setup->{home_dir}/bar.txt");
+
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $src_file)) {
+      die("Can't set owner of $src_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -5290,7 +4755,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -5299,12 +4764,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -5326,16 +4792,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -5362,7 +4828,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -5371,7 +4836,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -5381,36 +4846,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_symlink_allowed {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -5418,6 +4863,13 @@ sub dbacl_sftp_symlink_allowed {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -5434,7 +4886,6 @@ CREATE TABLE ftpacl (
 CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, create_acl) VALUES ('$home_dir', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -5457,30 +4908,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $src_file = File::Spec->rel2abs("$home_dir/foo.txt");
+  my $src_file = File::Spec->rel2abs("$setup->{home_dir}/foo.txt");
   if (open(my $fh, "> $src_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -5491,17 +4919,33 @@ EOS
     die("Can't open $src_file: $!");
   }
 
-  my $dst_file = File::Spec->rel2abs("$home_dir/foo.lnk");
+  my $dst_file = File::Spec->rel2abs("$setup->{home_dir}/foo.lnk");
+
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $src_file)) {
+      die("Can't set owner of $src_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -5514,7 +4958,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -5523,12 +4967,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -5550,16 +4995,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -5584,9 +5029,7 @@ EOS
       unless (-l $dst_file) {
         die("$dst_file symlink does not exist as expected");
       }
-
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -5595,7 +5038,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -5605,36 +5048,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_symlink_src_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -5642,6 +5065,13 @@ sub dbacl_sftp_symlink_src_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -5659,7 +5089,6 @@ CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, create_acl) VALUES ('$home_dir/foo.txt', 'false');
 INSERT INTO ftpacl (path, create_acl) VALUES ('$home_dir/foo.lnk', 'true');
-
 EOS
 
     unless (close($fh)) {
@@ -5682,30 +5111,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $src_file = File::Spec->rel2abs("$home_dir/foo.txt");
+  my $src_file = File::Spec->rel2abs("$setup->{home_dir}/foo.txt");
   if (open(my $fh, "> $src_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -5716,17 +5122,33 @@ EOS
     die("Can't open $src_file: $!");
   }
 
-  my $dst_file = File::Spec->rel2abs("$home_dir/foo.lnk");
+  my $dst_file = File::Spec->rel2abs("$setup->{home_dir}/foo.lnk");
+
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $src_file)) {
+      die("Can't set owner of $src_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -5739,7 +5161,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -5748,12 +5170,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -5775,16 +5198,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -5811,7 +5234,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -5820,7 +5242,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -5830,36 +5252,16 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 sub dbacl_sftp_symlink_dst_denied {
   my $self = shift;
   my $tmpdir = $self->{tmpdir};
-
-  my $config_file = "$tmpdir/dbacl.conf";
-  my $pid_file = File::Spec->rel2abs("$tmpdir/dbacl.pid");
-  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/dbacl.scoreboard");
-
-  my $log_file = File::Spec->rel2abs('tests.log');
-
-  my $auth_user_file = File::Spec->rel2abs("$tmpdir/dbacl.passwd");
-  my $auth_group_file = File::Spec->rel2abs("$tmpdir/dbacl.group");
-
-  my $user = 'proftpd';
-  my $passwd = 'test';
-  my $group = 'ftpd';
-  my $home_dir = File::Spec->rel2abs($tmpdir);
-  my $uid = 500;
-  my $gid = 500;
+  my $setup = test_setup($tmpdir, 'dbacl');
 
   my $db_file = File::Spec->rel2abs("$tmpdir/proftpd.db");
 
@@ -5867,6 +5269,13 @@ sub dbacl_sftp_symlink_dst_denied {
   my $db_script = File::Spec->rel2abs("$tmpdir/proftpd.sql");
 
   if (open(my $fh, "> $db_script")) {
+    my $home_dir = $setup->{home_dir};
+
+    if ($^O eq 'darwin') {
+      # MacOSX-specific hack
+      $home_dir = '/private' . $home_dir;
+    }
+
     print $fh <<EOS;
 CREATE TABLE ftpacl (
   path TEXT NOT NULL,
@@ -5884,7 +5293,6 @@ CREATE INDEX ftpacl_path_idx ON ftpacl (path);
 
 INSERT INTO ftpacl (path, create_acl) VALUES ('$home_dir/foo.txt', 'true');
 INSERT INTO ftpacl (path, create_acl) VALUES ('$home_dir/foo.lnk', 'false');
-
 EOS
 
     unless (close($fh)) {
@@ -5907,30 +5315,7 @@ EOS
     print STDERR "Output: ", join('', @output), "\n";
   }
 
-  # Make sure that, if we're running as root, the database file has
-  # the permissions/privs set for use by proftpd
-  if ($< == 0) {
-    unless (chmod(0666, $db_file)) {
-      die("Can't set perms on $db_file to 0666: $!");
-    }
-
-    unless (chmod(0755, $home_dir)) {
-      die("Can't set perms on $home_dir to 0755: $!");
-    }
-
-    unless (chown($uid, $gid, $home_dir)) {
-      die("Can't set owner of $home_dir to $uid/$gid: $!");
-    }
-  }
-
-  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
-    '/bin/bash');
-  auth_group_write($auth_group_file, $group, $gid, $user);
-
-  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
-  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
-
-  my $src_file = File::Spec->rel2abs("$home_dir/foo.txt");
+  my $src_file = File::Spec->rel2abs("$setup->{home_dir}/foo.txt");
   if (open(my $fh, "> $src_file")) {
     print $fh "Hello, World!\n";
     unless (close($fh)) {
@@ -5941,17 +5326,33 @@ EOS
     die("Can't open $src_file: $!");
   }
 
-  my $dst_file = File::Spec->rel2abs("$home_dir/foo.lnk");
+  my $dst_file = File::Spec->rel2abs("$setup->{home_dir}/foo.lnk");
+
+  # Make sure that, if we're running as root, the database file has
+  # the permissions/privs set for use by proftpd
+  if ($< == 0) {
+    unless (chmod(0666, $db_file)) {
+      die("Can't set perms on $db_file to 0666: $!");
+    }
+
+    unless (chown($setup->{uid}, $setup->{gid}, $src_file)) {
+      die("Can't set owner of $src_file to $setup->{uid}/$setup->{gid}: $!");
+    }
+  }
+
+  my $rsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_rsa_key");
+  my $dsa_host_key = File::Spec->rel2abs("$ENV{PROFTPD_TEST_DIR}/t/etc/modules/mod_sftp/ssh_host_dsa_key");
 
   my $config = {
-    PidFile => $pid_file,
-    ScoreboardFile => $scoreboard_file,
-    SystemLog => $log_file,
-    TraceLog => $log_file,
+    PidFile => $setup->{pid_file},
+    ScoreboardFile => $setup->{scoreboard_file},
+    SystemLog => $setup->{log_file},
+    TraceLog => $setup->{log_file},
     Trace => 'dbacl:20 ssh2:20 sftp:20',
 
-    AuthUserFile => $auth_user_file,
-    AuthGroupFile => $auth_group_file,
+    AuthUserFile => $setup->{auth_user_file},
+    AuthGroupFile => $setup->{auth_group_file},
+    AuthOrder => 'mod_auth_file.c',
 
     IfModules => {
       'mod_dbacl.c' => {
@@ -5964,7 +5365,7 @@ EOS
 
       'mod_sftp.c' => [
         "SFTPEngine on",
-        "SFTPLog $log_file",
+        "SFTPLog $setup->{log_file}",
         "SFTPHostKey $rsa_host_key",
         "SFTPHostKey $dsa_host_key",
       ],
@@ -5973,12 +5374,13 @@ EOS
         SQLEngine => 'log',
         SQLBackend => 'sqlite3',
         SQLConnectInfo => $db_file,
-        SQLLogFile => $log_file,
+        SQLLogFile => $setup->{log_file},
       },
     },
   };
 
-  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+  my ($port, $config_user, $config_group) = config_write($setup->{config_file},
+    $config);
 
   # Open pipes, for use between the parent and child processes.  Specifically,
   # the child will indicate when it's done with its test by writing a message
@@ -6000,16 +5402,16 @@ EOS
   defined(my $pid = fork()) or die("Can't fork: $!");
   if ($pid) {
     eval {
-      my $ssh2 = Net::SSH2->new();
-
+      # Allow for server startup
       sleep(1);
 
+      my $ssh2 = Net::SSH2->new();
       unless ($ssh2->connect('127.0.0.1', $port)) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't connect to SSH2 server: [$err_name] ($err_code) $err_str");
       }
 
-      unless ($ssh2->auth_password($user, $passwd)) {
+      unless ($ssh2->auth_password($setup->{user}, $setup->{passwd})) {
         my ($err_code, $err_name, $err_str) = $ssh2->error();
         die("Can't login to SSH2 server: [$err_name] ($err_code) $err_str");
       }
@@ -6036,7 +5438,6 @@ EOS
 
       $ssh2->disconnect();
     };
-
     if ($@) {
       $ex = $@;
     }
@@ -6045,7 +5446,7 @@ EOS
     $wfh->flush();
 
   } else {
-    eval { server_wait($config_file, $rfh) };
+    eval { server_wait($setup->{config_file}, $rfh) };
     if ($@) {
       warn($@);
       exit 1;
@@ -6055,15 +5456,10 @@ EOS
   }
 
   # Stop server
-  server_stop($pid_file);
-
+  server_stop($setup->{pid_file});
   $self->assert_child_ok($pid);
 
-  if ($ex) {
-    die($ex);
-  }
-
-  unlink($log_file);
+  test_cleanup($setup->{log_file}, $ex);
 }
 
 1;
