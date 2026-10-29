@@ -878,20 +878,20 @@ static void dbacl_set_error_response(cmd_rec *cmd, const char *msg) {
 
 /* usage: DBACLEngine on|off */
 MODRET set_dbaclengine(cmd_rec *cmd) {
-  int bool = -1;
+  int engine = -1;
   config_rec *c = NULL;
 
   CHECK_ARGS(cmd, 1);
   CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL);
 
-  bool = get_boolean(cmd, 1);
-  if (bool == -1) {
+  engine = get_boolean(cmd, 1);
+  if (engine == -1) {
     CONF_ERROR(cmd, "expected Boolean parameter");
   }
 
   c = add_config_param(cmd->argv[0], 1, NULL);
   c->argv[0] = pcalloc(c->pool, sizeof(int));
-  *((int *) c->argv[0]) = bool;
+  *((int *) c->argv[0]) = engine;
 
   return PR_HANDLED(cmd);
 }
