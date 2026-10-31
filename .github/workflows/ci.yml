@@ -4,9 +4,19 @@ on:
   push:
     branches:
       - master
+    paths-ignore:
+      - '**/*.html'
+      - '**/*.md'
+      - '**/*.pl'
+      - '**/*.pm'
   pull_request:
     branches:
       - master
+    paths-ignore:
+      - '**/*.html'
+      - '**/*.md'
+      - '**/*.pl'
+      - '**/*.pm'
   schedule:
     - cron: '11 1 * * 0'
 
